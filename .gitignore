@@ -3,3 +3,5 @@ voice_assignments.json
 .voice_ui_launching
 __pycache__/
 *.pyc
+.claude/
+.serena/

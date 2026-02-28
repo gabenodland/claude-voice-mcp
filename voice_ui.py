@@ -28,21 +28,26 @@ import json
 import os
 import queue
 import random
+import re
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
 import time
+import uuid
 import tkinter as tk
 from tkinter import ttk
 from datetime import datetime
 from pathlib import Path
 
+from voice_common import VOICE_SERVER_PORT, DEFAULT_RATE, validate_rate
+
 # ── Constants ────────────────────────────────────────────────────────────────
 
-VOICE_SERVER_PORT = 52718
 HISTORY_DIR = Path(tempfile.gettempdir()) / "claude_voice_history"
 MAX_HISTORY = 25
+MAX_HISTORY_AGE_SECS = 86400  # Clean up orphaned MP3s older than 24 hours
 
 # Dark theme (Catppuccin Mocha)
 C = {
@@ -60,19 +65,19 @@ C = {
 
 # Model display names (derived from agent ID prefix)
 MODEL_DISPLAY = {
-    "opus": "Opus 4.6",
-    "sonnet": "Sonnet 4.6",
-    "haiku": "Haiku 4.5",
+    "opus": "Opus",
+    "sonnet": "Sonnet",
+    "haiku": "Haiku",
 }
 
 
 def _model_from_agent(agent_id: str) -> str:
-    """Extract model display name from agent ID prefix (e.g. 'opus-main' → 'Opus 4.6')."""
+    """Extract model display name from agent ID prefix (e.g. 'opus-main' → 'Opus')."""
     prefix = agent_id.split("-")[0].lower() if agent_id else ""
     return MODEL_DISPLAY.get(prefix, prefix or "?")
 
 
-# Curated voice pool — 14 distinct English voices
+# Curated voice pool — 42 English voices across 14 locales
 VOICE_POOL = [
     # ── United States ──
     {"name": "en-US-AriaNeural", "gender": "Female", "locale": "en-US", "label": "Aria (US)"},
@@ -279,6 +284,12 @@ class MCIPlayer:
 
 class VoicePlayerUI:
     def __init__(self):
+        # Set AppUserModelID BEFORE creating the window so taskbar uses our icon
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("claude.voice.mcp")
+        except (AttributeError, OSError):
+            pass
+
         self.root = tk.Tk()
         self.root.title("Claude Voice")
         self.root.configure(bg=C["bg"])
@@ -303,6 +314,7 @@ class VoicePlayerUI:
         self._gen_id = 0  # generation counter for cancellation
 
         HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        self._cleanup_old_audio()
 
         self._build_ui()
         self._bind_keys()
@@ -318,6 +330,20 @@ class VoicePlayerUI:
         ico_path = Path(__file__).parent / "pacman.ico"
         if ico_path.exists():
             self.root.iconbitmap(str(ico_path))
+
+    @staticmethod
+    def _cleanup_old_audio():
+        """Remove orphaned MP3 files older than 24 hours from the history directory."""
+        try:
+            cutoff = time.time() - MAX_HISTORY_AGE_SECS
+            for f in HISTORY_DIR.glob("voice_*.mp3"):
+                try:
+                    if f.stat().st_mtime < cutoff:
+                        f.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
 
     # ── UI Construction ──────────────────────────────────────────────────
 
@@ -446,8 +472,10 @@ class VoicePlayerUI:
         if sys.platform == "win32":
             os.startfile(str(path))
         elif sys.platform == "darwin":
+            # TODO: cross-platform — test on macOS
             subprocess.Popen(["open", str(path)])
         else:
+            # TODO: cross-platform — test on Linux
             subprocess.Popen(["xdg-open", str(path)])
 
     def _bind_keys(self):
@@ -490,8 +518,12 @@ class VoicePlayerUI:
             msg = json.loads(data.decode("utf-8"))
             response = self._dispatch(msg)
             conn.sendall(response.encode("utf-8"))
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[voice_ui] TCP handler error: {e}", file=sys.stderr)
+            try:
+                conn.sendall(json.dumps({"ok": False, "error": str(e)}).encode("utf-8"))
+            except Exception:
+                pass
         finally:
             conn.close()
 
@@ -591,6 +623,7 @@ class VoicePlayerUI:
         model = _model_from_agent(name)
         session = msg.get("session", "default")
         voice = msg.get("voice", "")
+        rate = msg.get("rate", DEFAULT_RATE)
         now = datetime.now()
         ts = now.strftime("%H:%M:%S")
 
@@ -610,8 +643,8 @@ class VoicePlayerUI:
 
         def gen_and_enqueue():
             try:
-                path = self._generate_tts(text, voice)
-                item = dict(text=text, agent=agent, name=name, model=model, session=session, voice=voice, audio_path=str(path), timestamp=ts, created=now)
+                path = self._generate_tts(text, voice, rate)
+                item = dict(text=text, agent=agent, name=name, model=model, session=session, voice=voice, rate=rate, audio_path=str(path), timestamp=ts, created=now)
                 self._play_queue.put(item)
                 self.root.after(0, self._drain_play_queue)
             except Exception as e:
@@ -619,13 +652,20 @@ class VoicePlayerUI:
 
         threading.Thread(target=gen_and_enqueue, daemon=True).start()
 
-    def _generate_tts(self, text, voice):
+    def _generate_tts(self, text, voice, rate=DEFAULT_RATE):
         import edge_tts
 
-        path = HISTORY_DIR / f"voice_{int(time.time() * 1000)}.mp3"
+        # Strip single-character backslash escapes (e.g. \! from shell escaping)
+        clean_text = re.sub(r'\\(.)', r'\1', text)
+
+        # Validate rate at point of consumption (defense in depth)
+        rate = validate_rate(rate)
+
+        path = HISTORY_DIR / f"voice_{uuid.uuid4().hex[:12]}.mp3"
         loop = asyncio.new_event_loop()
         try:
-            loop.run_until_complete(edge_tts.Communicate(text, voice).save(str(path)))
+            comm = edge_tts.Communicate(clean_text, voice, rate=rate)
+            loop.run_until_complete(comm.save(str(path)))
         finally:
             loop.close()
         return path

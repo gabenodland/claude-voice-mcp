@@ -10,7 +10,7 @@ a random voice from the pool. Voices persist across restarts.
 
 Usage:
     python voice.py "Your message here" --agent opus-main --session settings
-    python voice.py "Message" --agent sonnet-explore --session settings
+    python voice.py "Message" --agent sonnet-explore --session settings --rate "+50%"
     python voice.py --assignments
     python voice.py --pool
     python voice.py --stop
@@ -19,78 +19,18 @@ Usage:
 
 import argparse
 import asyncio
-import json
 import os
-import socket
-import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 
-# Server port (must match voice_ui.py)
-VOICE_SERVER_PORT = 52718
-
-DEFAULT_VOICE = "en-US-AriaNeural"
-
-
-def send_command(message: dict) -> dict | None:
-    """Send a command to the voice UI server. Returns parsed JSON response or None."""
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(5.0)
-        sock.connect(("127.0.0.1", VOICE_SERVER_PORT))
-        sock.sendall(json.dumps(message).encode("utf-8"))
-        sock.shutdown(socket.SHUT_WR)
-        data = b""
-        while True:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            data += chunk
-        sock.close()
-        return json.loads(data.decode("utf-8"))
-    except (ConnectionRefusedError, socket.timeout, OSError):
-        return None
-    except json.JSONDecodeError:
-        return None
-
-
-def ensure_server() -> bool:
-    """Make sure the voice UI server is running. Returns True if reachable."""
-    result = send_command({"cmd": "status"})
-    if result:
-        return True
-
-    launch_ui_server()
-    for _ in range(10):
-        time.sleep(0.5)
-        result = send_command({"cmd": "status"})
-        if result:
-            return True
-    return False
-
-
-def launch_ui_server():
-    """Launch voice_ui.py as a detached background process."""
-    ui_script = Path(__file__).parent / "voice_ui.py"
-
-    if sys.platform == "win32":
-        DETACHED = 0x00000008
-        NEW_GROUP = 0x00000200
-        subprocess.Popen(
-            [sys.executable, str(ui_script)],
-            creationflags=DETACHED | NEW_GROUP,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    else:
-        subprocess.Popen(
-            [sys.executable, str(ui_script)],
-            start_new_session=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+from voice_common import (
+    DEFAULT_RATE,
+    DEFAULT_VOICE,
+    send_command,
+    ensure_server,
+    validate_rate,
+)
 
 
 async def list_voices(language_filter: str | None = None):
@@ -107,14 +47,15 @@ async def list_voices(language_filter: str | None = None):
         print(f"{voice['ShortName']:<30} {voice['Gender']:<8} {voice['Locale']:<10}")
 
 
-async def _fallback_speak(text: str, voice: str):
+async def _fallback_speak(text: str, voice: str, rate: str = DEFAULT_RATE):
     """Direct playback without UI — used if server can't be reached."""
+    import subprocess
     import edge_tts
 
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
         temp_path = f.name
     try:
-        communicate = edge_tts.Communicate(text, voice)
+        communicate = edge_tts.Communicate(text, voice, rate=rate)
         await communicate.save(temp_path)
         subprocess.run(
             ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", temp_path],
@@ -138,6 +79,8 @@ def cmd_speak(args):
         print("Error: text is required for speak", file=sys.stderr)
         sys.exit(1)
 
+    rate = validate_rate(args.rate) if args.rate else DEFAULT_RATE
+
     session = get_session(args)
     message = {
         "cmd": "speak",
@@ -145,13 +88,14 @@ def cmd_speak(args):
         "agent": args.agent or "unknown",
         "name": args.name or args.agent or "unknown",
         "session": session,
+        "rate": rate,
     }
     if args.voice:
         message["voice"] = args.voice
 
     if not ensure_server():
         print("Voice UI unavailable, falling back to direct playback.", file=sys.stderr)
-        asyncio.run(_fallback_speak(args.text, args.voice or DEFAULT_VOICE))
+        asyncio.run(_fallback_speak(args.text, args.voice or DEFAULT_VOICE, rate))
         return
 
     result = send_command(message)
@@ -278,6 +222,7 @@ def main():
     parser.add_argument("--agent", "-a", help="Agent ID (e.g. opus-main, sonnet-explore)")
     parser.add_argument("--name", "-n", help="Display name (e.g. 'Code Reviewer')")
     parser.add_argument("--session", "-s", help="Session name (default: cwd folder name)")
+    parser.add_argument("--rate", "-r", help='Speech rate (e.g. "+25%%", "-10%%", "+0%%")')
 
     # Query commands
     parser.add_argument("--assignments", action="store_true", help="Show agent voice assignments")

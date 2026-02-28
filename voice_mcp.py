@@ -10,27 +10,29 @@ Usage in ~/.claude/settings.json or claude_desktop_config.json:
         "mcpServers": {
             "voice": {
                 "command": "python",
-                "args": ["c:/projects/claude-voice-mcp/voice_mcp.py"]
+                "args": ["/path/to/voice_mcp.py"]
             }
         }
     }
 """
 
 import json
-import socket
-import subprocess
-import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+from voice_common import (
+    DEFAULT_RATE,
+    send_command,
+    ensure_server,
+    validate_rate,
+)
+
 # ── Server Setup ─────────────────────────────────────────────────────────────
 
 mcp = FastMCP("voice")
 
-VOICE_SERVER_PORT = 52718
 LOG_DIR = Path(__file__).parent
 LOG_FILE = LOG_DIR / "voice_log.jsonl"
 
@@ -47,94 +49,6 @@ def log_command(tool: str, params: dict, result: str):
         f.write(json.dumps(entry) + "\n")
 
 
-# ── TCP Client ───────────────────────────────────────────────────────────────
-
-
-def send_command(message: dict) -> dict | None:
-    """Send a command to the voice UI TCP server."""
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(5.0)
-        sock.connect(("127.0.0.1", VOICE_SERVER_PORT))
-        sock.sendall(json.dumps(message).encode("utf-8"))
-        sock.shutdown(socket.SHUT_WR)
-        data = b""
-        while True:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            data += chunk
-        sock.close()
-        return json.loads(data.decode("utf-8"))
-    except (ConnectionRefusedError, socket.timeout, OSError):
-        return None
-    except json.JSONDecodeError:
-        return None
-
-
-_LAUNCH_LOCK = Path(__file__).parent / ".voice_ui_launching"
-
-
-def ensure_server() -> bool:
-    """Make sure the voice UI server is running."""
-    result = send_command({"cmd": "status"})
-    if result:
-        return True
-
-    # Use a lock file to prevent multiple processes from launching the UI
-    try:
-        # Check if another process is already launching (lock file < 15s old)
-        if _LAUNCH_LOCK.exists():
-            age = time.time() - _LAUNCH_LOCK.stat().st_mtime
-            if age < 15:
-                # Someone else is launching, just wait for it
-                for _ in range(10):
-                    time.sleep(0.5)
-                    result = send_command({"cmd": "status"})
-                    if result:
-                        return True
-                return False
-
-        # We're the launcher — create lock file
-        _LAUNCH_LOCK.write_text(str(time.time()))
-    except OSError:
-        pass
-
-    ui_script = Path(__file__).parent / "voice_ui.py"
-    if sys.platform == "win32":
-        DETACHED = 0x00000008
-        NEW_GROUP = 0x00000200
-        subprocess.Popen(
-            [sys.executable, str(ui_script)],
-            creationflags=DETACHED | NEW_GROUP,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    else:
-        subprocess.Popen(
-            [sys.executable, str(ui_script)],
-            start_new_session=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-    for _ in range(10):
-        time.sleep(0.5)
-        result = send_command({"cmd": "status"})
-        if result:
-            try:
-                _LAUNCH_LOCK.unlink(missing_ok=True)
-            except OSError:
-                pass
-            return True
-
-    try:
-        _LAUNCH_LOCK.unlink(missing_ok=True)
-    except OSError:
-        pass
-    return False
-
-
 # ── MCP Tools ────────────────────────────────────────────────────────────────
 
 
@@ -147,6 +61,7 @@ def voice_speak(
     session: str = "default",
     task: str = "main",
     voice: str | None = None,
+    rate: str = DEFAULT_RATE,
 ) -> str:
     """Speak a message aloud using text-to-speech. Each unique combination of
     project + session + task + model + role gets a persistent voice from a pool of 42 voices.
@@ -176,9 +91,12 @@ def voice_speak(
         session: What the user asked for — one word like "editor" or "auth-fix". No slashes.
         task: What you are doing — "main" for main agents, or a short description for subagents.
         voice: Optional override. A full Edge TTS voice ID like "en-US-AriaNeural". Rarely needed.
+        rate: Speech rate adjustment. Default "+25%". Use "+0%" for normal, up to "+100%" for fast, or negative like "-10%" for slower.
     """
     if not ensure_server():
         return "Error: Voice UI server is not running and could not be started."
+
+    rate = validate_rate(rate)
 
     agent_id = f"{model}-{role}"
     session_path = f"{project}/{session}/{task}"
@@ -188,6 +106,7 @@ def voice_speak(
         "agent": agent_id,
         "name": agent_id,
         "session": session_path,
+        "rate": rate,
     }
     if voice:
         message["voice"] = voice
@@ -197,10 +116,10 @@ def voice_speak(
         assigned_voice = result.get("voice", "?")
         label = result.get("label", "")
         response = f"[{session_path}/{agent_id}] {label}: {text}"
-        log_command("voice_speak", {"model": model, "role": role, "project": project, "session": session, "task": task, "text": text}, response)
+        log_command("voice_speak", {"model": model, "role": role, "project": project, "session": session, "task": task, "rate": rate, "text": text}, response)
         return response
     error = f"Error: {result.get('error', 'unknown') if result else 'server unreachable'}"
-    log_command("voice_speak", {"model": model, "role": role, "project": project, "session": session, "task": task, "text": text}, error)
+    log_command("voice_speak", {"model": model, "role": role, "project": project, "session": session, "task": task, "rate": rate, "text": text}, error)
     return error
 
 
@@ -219,7 +138,7 @@ def voice_stop() -> str:
 def voice_assignments() -> str:
     """Show all current voice assignments (which agent has which voice).
 
-    Returns a formatted table of all project/session/agent → voice mappings.
+    Returns a formatted table of all project/session/agent -> voice mappings.
     """
     if not ensure_server():
         return "Error: Voice UI server is not running."
@@ -243,7 +162,7 @@ def voice_assignments() -> str:
 def voice_pool() -> str:
     """Show the curated voice pool with assignment status.
 
-    Returns a table of all 42 available voices with their gender, locale,
+    Returns a table of all available voices with their gender, locale,
     and which agent (if any) they're currently assigned to.
     """
     if not ensure_server():
