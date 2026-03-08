@@ -121,26 +121,26 @@ def launch_ui_server():
                  f"([wmiclass]'Win32_Process').Create('{cmd_line}')"],
                 capture_output=True, text=True, timeout=10,
             )
-            if result.returncode == 0 and "ReturnValue" in result.stdout:
+            # WMI returns ReturnValue : 0 on success, non-zero on failure
+            if result.returncode == 0 and re.search(r"ReturnValue\s*:\s*0\b", result.stdout):
                 return
         except (subprocess.TimeoutExpired, OSError):
             pass
 
-        # Fallback: direct Popen (may be slow inside Electron)
-        CREATE_NO_WINDOW = 0x08000000
-        subprocess.Popen(
-            [exe, str(ui_script)],
-            creationflags=CREATE_NO_WINDOW,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        # Fallback: direct Popen (may be slow inside Electron's Job Object)
+        _popen_ui_server(exe, ui_script)
     else:
-        subprocess.Popen(
-            [sys.executable, str(ui_script)],
-            start_new_session=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        _popen_ui_server(sys.executable, ui_script)
+
+
+def _popen_ui_server(exe: str, script: Path):
+    """Launch voice_ui.py via subprocess.Popen with platform-appropriate flags."""
+    kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+    else:
+        kwargs["start_new_session"] = True
+    subprocess.Popen([exe, str(script)], **kwargs)
 
 
 _LAUNCH_MUTEX_NAME = "Claude_Voice_MCP_LaunchLock"
@@ -193,9 +193,10 @@ def _launch_under_lock() -> bool:
 def _poll_for_server(timeout: float = 10.0) -> bool:
     """Poll for server readiness up to `timeout` seconds (wall-clock)."""
     deadline = time.time() + timeout
-    while time.time() < deadline:
-        time.sleep(0.25)
+    while True:
         result = send_command({"cmd": "status"}, timeout=0.5)
         if result:
             return True
-    return False
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.25)
