@@ -5,12 +5,12 @@ Claude Voice client — sends commands to the Voice Player UI.
 If the UI isn't running, launches it as a background process.
 Falls back to direct ffplay playback if the UI can't be reached.
 
-Voice assignment is session-scoped. Each unique session/agent combo gets
-a random voice from the pool. Voices persist across restarts.
+Voice assignment is identity-scoped. Each unique project/task/role/model combo
+gets a random voice from the pool. Voices persist across restarts.
 
 Usage:
-    python voice.py "Your message here" --agent opus-main --session settings
-    python voice.py "Message" --agent sonnet-explore --session settings --rate "+50%"
+    python voice.py "Your message here" --project myapp --task auth-fix --role main --model opus
+    python voice.py "Message" --project myapp --task auth-fix --role explore --model sonnet --rate "+50%"
     python voice.py --assignments
     python voice.py --pool
     python voice.py --stop
@@ -66,13 +66,6 @@ async def _fallback_speak(text: str, voice: str, rate: str = DEFAULT_RATE):
             os.unlink(temp_path)
 
 
-def get_session(args) -> str:
-    """Get session name: explicit --session, or cwd folder name as fallback."""
-    if args.session:
-        return args.session
-    return Path.cwd().name
-
-
 def cmd_speak(args):
     """Send a speak command."""
     if not args.text:
@@ -80,14 +73,20 @@ def cmd_speak(args):
         sys.exit(1)
 
     rate = validate_rate(args.rate) if args.rate else DEFAULT_RATE
+    project = args.project or Path.cwd().name
+    task = args.task or "default"
+    role = args.role or "main"
+    model = args.model or "unknown"
 
-    session = get_session(args)
+    agent_key = f"{project}/{task}/{role}"
+    agent_display = f"{agent_key} ({model})"
+
     message = {
         "cmd": "speak",
         "text": args.text,
-        "agent": args.agent or "unknown",
-        "name": args.name or args.agent or "unknown",
-        "session": session,
+        "agent": agent_key,
+        "model": model,
+        "agent_display": agent_display,
         "rate": rate,
     }
     if args.voice:
@@ -103,7 +102,7 @@ def cmd_speak(args):
         voice = result.get("voice", "?")
         label = result.get("label", "")
         if label:
-            print(f"[{session}/{label}] {voice}")
+            print(f"[{agent_display}] {label}: {voice}")
         return
 
     print("Failed to send message", file=sys.stderr)
@@ -129,29 +128,6 @@ def cmd_assignments(args):
     print("-" * 80)
     for key, info in sorted(assignments.items()):
         print(f"{key:<35} {info['voice']:<30} {info['label']}")
-
-
-def cmd_assign(args):
-    """Manually assign a voice to an agent."""
-    if not args.assign or len(args.assign) != 2:
-        print("Usage: --assign AGENT VOICE", file=sys.stderr)
-        sys.exit(1)
-
-    agent, voice = args.assign
-    session = get_session(args)
-    key = f"{session}/{agent}"
-
-    if not ensure_server():
-        print("Voice UI not running.", file=sys.stderr)
-        sys.exit(1)
-
-    result = send_command({"cmd": "assign", "agent": key, "voice": voice})
-    if result and result.get("ok"):
-        print(f"Assigned {voice} to {key}")
-    else:
-        error = result.get("error", "unknown error") if result else "server unreachable"
-        print(f"Failed: {error}", file=sys.stderr)
-        sys.exit(1)
 
 
 def cmd_pool(args):
@@ -215,18 +191,18 @@ def cmd_reset(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Claude Voice — TTS with session-scoped voice assignment"
+        description="Claude Voice — TTS with identity-scoped voice assignment"
     )
     parser.add_argument("text", nargs="?", help="Text to speak")
     parser.add_argument("--voice", "-v", help="Override voice (bypasses pool assignment)")
-    parser.add_argument("--agent", "-a", help="Agent ID (e.g. opus-main, sonnet-explore)")
-    parser.add_argument("--name", "-n", help="Display name (e.g. 'Code Reviewer')")
-    parser.add_argument("--session", "-s", help="Session name (default: cwd folder name)")
+    parser.add_argument("--project", "-p", help="Project name (default: cwd folder name)")
+    parser.add_argument("--task", "-t", help="Task name (e.g. 'auth-fix', 'mute-button')")
+    parser.add_argument("--role", help="Agent role: main, explore, test, plan, review (default: main)")
+    parser.add_argument("--model", "-m", help="Model name: opus, sonnet, haiku")
     parser.add_argument("--rate", "-r", help='Speech rate (e.g. "+25%%", "-10%%", "+0%%")')
 
     # Query commands
     parser.add_argument("--assignments", action="store_true", help="Show agent voice assignments")
-    parser.add_argument("--assign", nargs=2, metavar=("AGENT", "VOICE"), help="Assign voice to agent")
     parser.add_argument("--pool", action="store_true", help="Show curated voice pool")
     parser.add_argument("--stop", action="store_true", help="Stop current playback")
     parser.add_argument("--status", action="store_true", help="Show playback status")
@@ -242,8 +218,6 @@ def main():
         asyncio.run(list_voices(args.language))
     elif args.assignments:
         cmd_assignments(args)
-    elif args.assign:
-        cmd_assign(args)
     elif args.pool:
         cmd_pool(args)
     elif args.stop:

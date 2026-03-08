@@ -4,22 +4,16 @@ Claude Voice Player UI — persistent background process.
 
 Shows a dark-themed tkinter popup with:
 - Current message text + agent label
-- Play / Pause / Replay controls
+- Pause / Replay / Mute controls
 - Message history (clickable to replay)
-- TCP socket server receiving commands from voice.py
+- TCP socket server receiving commands from voice_mcp.py
 
 Audio playback uses Windows MCI (zero dependencies).
 TTS generation uses edge_tts.
 
 TCP Protocol:
-  {"cmd": "speak", "text": "...", "agent": "opus-main", "name": "Main"}
-  {"cmd": "assignments"}     → returns JSON {agent: {voice, label}}
-  {"cmd": "assign", "agent": "opus-main", "voice": "en-GB-SoniaNeural"}
-  {"cmd": "pool"}            → returns JSON [{name, gender, locale, label, assigned_to}]
-  {"cmd": "stop"}            → stops current playback
+  {"cmd": "speak", "text": "...", "agent": "project/task/role", "model": "opus", "agent_display": "project/task/role (opus)"}
   {"cmd": "status"}          → returns JSON {state, agent, text}
-  {"cmd": "reset"}           → clears all voice assignments
-  Legacy: no "cmd" field     → treated as "speak"
 """
 
 import asyncio
@@ -41,7 +35,10 @@ from tkinter import ttk
 from datetime import datetime
 from pathlib import Path
 
-from voice_common import VOICE_SERVER_PORT, DEFAULT_RATE, validate_rate
+import pystray
+from PIL import Image
+
+from voice_common import VOICE_SERVER_PORT, DEFAULT_RATE, LOG_FILE, validate_rate, send_command, kill_port_holder
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -61,20 +58,9 @@ C = {
     "yellow": "#f9e2af",
     "red": "#f38ba8",
     "border": "#585b70",
+    "muted_bg": "#4a2020",
+    "muted_fg": "#ff6b6b",
 }
-
-# Model display names (derived from agent ID prefix)
-MODEL_DISPLAY = {
-    "opus": "Opus",
-    "sonnet": "Sonnet",
-    "haiku": "Haiku",
-}
-
-
-def _model_from_agent(agent_id: str) -> str:
-    """Extract model display name from agent ID prefix (e.g. 'opus-main' → 'Opus')."""
-    prefix = agent_id.split("-")[0].lower() if agent_id else ""
-    return MODEL_DISPLAY.get(prefix, prefix or "?")
 
 
 # Curated voice pool — 42 English voices across 14 locales
@@ -188,41 +174,6 @@ class VoiceRegistry:
             self._save()
             return pick["name"], pick["label"]
 
-    def assign(self, agent_id: str, voice_name: str) -> bool:
-        """Manually assign a voice. Returns True if voice was found in pool."""
-        with self._lock:
-            match = next((v for v in VOICE_POOL if v["name"] == voice_name), None)
-            if not match:
-                return False
-            self._assignments[agent_id] = {"voice": match["name"], "label": match["label"]}
-            self._save()
-            return True
-
-    def get_assignments(self) -> dict:
-        """Return all current assignments."""
-        with self._lock:
-            return dict(self._assignments)
-
-    def get_pool(self) -> list[dict]:
-        """Return pool with assignment info."""
-        with self._lock:
-            used_by = {}
-            for agent, info in self._assignments.items():
-                used_by[info["voice"]] = agent
-            return [
-                {**v, "assigned_to": used_by.get(v["name"])}
-                for v in VOICE_POOL
-            ]
-
-    def reset(self):
-        """Clear all assignments and delete save file."""
-        with self._lock:
-            self._assignments.clear()
-            try:
-                self._SAVE_FILE.unlink(missing_ok=True)
-            except OSError:
-                pass
-
 
 # ── Audio Player (Windows MCI) ──────────────────────────────────────────────
 
@@ -235,6 +186,7 @@ class MCIPlayer:
         self._alias = "claude_voice"
         self.current_file = None
         self._open = False
+        self._duration_ms = 0
 
     def _send(self, cmd):
         buf = ctypes.create_unicode_buffer(256)
@@ -247,6 +199,12 @@ class MCIPlayer:
         self._send(f'open "{self.current_file}" type mpegvideo alias {self._alias}')
         self._send(f"play {self._alias}")
         self._open = True
+        # Query duration so we can detect premature "stopped" reports
+        _, length_str = self._send(f"status {self._alias} length")
+        try:
+            self._duration_ms = int(length_str)
+        except (ValueError, TypeError):
+            self._duration_ms = 0
 
     def pause(self):
         if self._open:
@@ -274,9 +232,11 @@ class MCIPlayer:
             return "playing"
         if mode == "paused":
             return "paused"
-        # "stopped" or empty → playback ended
-        self._open = False
         return "stopped"
+
+    @property
+    def duration_ms(self):
+        return self._duration_ms
 
 
 # ── Voice Player UI ─────────────────────────────────────────────────────────
@@ -303,23 +263,29 @@ class VoicePlayerUI:
         self.root.geometry(f"{w}x{h}+{sw - w - 24}+{sh - h - 80}")
         self.root.minsize(340, 380)
 
-        self.msg_queue = queue.Queue()
-        self._play_queue = queue.Queue()  # items ready to play, in order
-        self._playing = False  # whether something is currently playing
-        self._play_started_at = 0  # time.time() when playback last started
-        self.history = []  # [{text, agent, voice, audio_path, timestamp}]
+        self.msg_queue = queue.Queue()   # raw messages from TCP
+        self._play_queue = queue.Queue() # items with TTS generated, in order, ready to play
+        self._muted = False
+        self._shutting_down = False      # set True on quit to unblock worker
+        self._msg_seq = 0               # sequence counter for ordering
+        self._seq_lock = threading.Lock()
+        self._reorder_buf = {}           # seq -> item, for resequencing TTS results
+        self._next_play_seq = 0          # next sequence number to send to play queue
+        self._reorder_lock = threading.Lock()
+        self.history = []
         self.player = MCIPlayer()
         self.registry = VoiceRegistry()
         self.current_item = None
-        self._gen_id = 0  # generation counter for cancellation
 
         HISTORY_DIR.mkdir(parents=True, exist_ok=True)
         self._cleanup_old_audio()
 
         self._build_ui()
         self._bind_keys()
+        self._setup_tray()
         self._start_server()
-        self._poll_queue()
+        self._start_tts_dispatcher()
+        self._start_playback_worker()
         self._poll_state()
         self._poll_history_age()
 
@@ -330,6 +296,50 @@ class VoicePlayerUI:
         ico_path = Path(__file__).parent / "pacman.ico"
         if ico_path.exists():
             self.root.iconbitmap(str(ico_path))
+
+    def _setup_tray(self):
+        """Create a system-tray icon with right-click menu."""
+        ico_path = Path(__file__).parent / "pacman.ico"
+        if ico_path.exists():
+            icon_image = Image.open(str(ico_path))
+        else:
+            # Fallback: tiny colored square
+            icon_image = Image.new("RGB", (64, 64), C["accent"])
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Show Window", self._tray_show, default=True),
+            pystray.MenuItem(
+                lambda item: "\u2714 Muted" if self._muted else "Mute",
+                self._tray_mute,
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit", self._tray_quit),
+        )
+        self._tray = pystray.Icon("claude_voice", icon_image, "Claude Voice", menu)
+        threading.Thread(target=self._tray.run, daemon=True).start()
+
+    def _tray_show(self):
+        """Show and raise the main window."""
+        self.root.after(0, self._restore_window)
+
+    def _restore_window(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def _tray_mute(self):
+        self.root.after(0, self._on_mute)
+
+    def _tray_quit(self):
+        """Actually exit the process."""
+        self.root.after(0, self._real_quit)
+
+    def _real_quit(self):
+        self._shutting_down = True
+        self.player.stop()
+        if hasattr(self, "_tray"):
+            self._tray.stop()
+        self.root.destroy()
 
     @staticmethod
     def _cleanup_old_audio():
@@ -393,18 +403,25 @@ class VoicePlayerUI:
             activeforeground=C["text"], bd=0, padx=14, pady=5,
             font=("Consolas", 10), cursor="hand2", relief="flat",
         )
-        self.play_btn = tk.Button(btn_box, text="\u25b6 Play", command=self._on_play, **bs)
-        self.play_btn.pack(side="left", padx=2)
         self.pause_btn = tk.Button(btn_box, text="\u23f8 Pause", command=self._on_pause, **bs)
         self.pause_btn.pack(side="left", padx=2)
         self.replay_btn = tk.Button(btn_box, text="\u21ba Replay", command=self._on_replay, **bs)
         self.replay_btn.pack(side="left", padx=2)
+        self.mute_btn = tk.Button(btn_box, text="\U0001f50a Sound", command=self._on_mute, **bs)
+        self.mute_btn.pack(side="left", padx=2)
 
+        status_row = tk.Frame(ctrl, bg=C["bg"])
+        status_row.pack(pady=(4, 0))
         self.status_text = tk.Label(
-            ctrl, text="Idle", fg=C["subtext"], bg=C["bg"],
+            status_row, text="Idle", fg=C["subtext"], bg=C["bg"],
             font=("Consolas", 9),
         )
-        self.status_text.pack(pady=(4, 0))
+        self.status_text.pack(side="left")
+        self.queue_label = tk.Label(
+            status_row, text="", fg=C["accent"], bg=C["bg"],
+            font=("Consolas", 9),
+        )
+        self.queue_label.pack(side="left", padx=(8, 0))
 
         # === History (Treeview table) ===
         hf = tk.Frame(self.root, bg=C["bg"])
@@ -430,18 +447,14 @@ class VoicePlayerUI:
         )
 
         self.hist_tree = ttk.Treeview(
-            hf, style="Voice.Treeview", columns=("ago", "session", "model", "name", "msg"),
+            hf, style="Voice.Treeview", columns=("ago", "agent", "msg"),
             show="headings", selectmode="browse",
         )
         self.hist_tree.heading("ago", text="Time", anchor="w")
-        self.hist_tree.heading("session", text="Session", anchor="w")
-        self.hist_tree.heading("model", text="Model", anchor="w")
-        self.hist_tree.heading("name", text="Agent", anchor="w")
+        self.hist_tree.heading("agent", text="Agent", anchor="w")
         self.hist_tree.heading("msg", text="Message", anchor="w")
         self.hist_tree.column("ago", width=90, minwidth=60, stretch=False)
-        self.hist_tree.column("session", width=70, minwidth=50, stretch=False)
-        self.hist_tree.column("model", width=70, minwidth=50, stretch=False)
-        self.hist_tree.column("name", width=85, minwidth=60, stretch=False)
+        self.hist_tree.column("agent", width=200, minwidth=120, stretch=False)
         self.hist_tree.column("msg", width=120, minwidth=80, stretch=True)
 
         sb = ttk.Scrollbar(hf, orient="vertical", command=self.hist_tree.yview)
@@ -451,6 +464,11 @@ class VoicePlayerUI:
 
         self.hist_tree.bind("<Double-Button-1>", self._on_hist_click)
         self.hist_tree.bind("<Return>", self._on_hist_click)
+
+        # Configure tags for row highlighting (once, not per refresh)
+        self.hist_tree.tag_configure("playing", background=C["accent"], foreground=C["bg"])
+        self.hist_tree.tag_configure("queued", foreground=C["subtext"])
+        self.hist_tree.tag_configure("done", foreground=C["text"])
 
         # === Footer with log file link ===
         log_path = Path(__file__).parent / "voice_log.jsonl"
@@ -481,6 +499,7 @@ class VoicePlayerUI:
     def _bind_keys(self):
         self.root.bind("<space>", lambda e: self._on_pause())
         self.root.bind("r", lambda e: self._on_replay())
+        self.root.bind("m", lambda e: self._on_mute())
         self.root.bind("<Escape>", lambda e: self._on_close())
         self.root.bind("<Control-q>", lambda e: self._on_close())
 
@@ -490,11 +509,23 @@ class VoicePlayerUI:
         def loop():
             srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                srv.bind(("127.0.0.1", VOICE_SERVER_PORT))
-            except OSError:
-                self.root.after(0, self.root.destroy)
-                return
+
+            # Retry bind up to 3 times, waiting for OS to release the port
+            for attempt in range(3):
+                try:
+                    srv.bind(("127.0.0.1", VOICE_SERVER_PORT))
+                    break
+                except OSError:
+                    if attempt < 2:
+                        # Don't kill_port_holder() here — the named mutex in
+                        # __main__ guarantees single instance. If bind fails,
+                        # the OS just hasn't released the port yet.
+                        time.sleep(1.5)
+                    else:
+                        self._log_error(f"Failed to bind port {VOICE_SERVER_PORT} after 3 attempts — exiting")
+                        self.root.after(0, self.root.destroy)
+                        return
+
             srv.listen(5)
             srv.settimeout(1.0)
             while True:
@@ -506,10 +537,20 @@ class VoicePlayerUI:
 
         threading.Thread(target=loop, daemon=True).start()
 
+    @staticmethod
+    def _log_error(msg: str):
+        """Append a timestamped error line to the error log."""
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                f.write(f"[{ts}] {msg}\n")
+        except OSError:
+            pass
+
     def _handle_conn(self, conn):
         try:
             data = b""
-            conn.settimeout(5.0)
+            conn.settimeout(10.0)
             while True:
                 chunk = conn.recv(4096)
                 if not chunk:
@@ -519,7 +560,7 @@ class VoicePlayerUI:
             response = self._dispatch(msg)
             conn.sendall(response.encode("utf-8"))
         except Exception as e:
-            print(f"[voice_ui] TCP handler error: {e}", file=sys.stderr)
+            self._log_error(f"TCP handler error: {e}")
             try:
                 conn.sendall(json.dumps({"ok": False, "error": str(e)}).encode("utf-8"))
             except Exception:
@@ -533,35 +574,21 @@ class VoicePlayerUI:
 
         if cmd == "speak":
             agent = msg.get("agent", "unknown")
-            session = msg.get("session", "default")
-            registry_key = f"{session}/{agent}"
+            model = msg.get("model", "unknown")
+            agent_display = msg.get("agent_display", agent)
+            registry_key = f"{agent}/{model}"
             voice_override = msg.get("voice")
             if voice_override:
-                voice = voice_override
-                self.registry.assign(registry_key, voice)
+                voice, label = voice_override, voice_override
             else:
-                voice, _ = self.registry.get_voice(registry_key)
+                voice, label = self.registry.get_voice(registry_key)
             msg["voice"] = voice
-            msg["session"] = session
+            msg["agent_display"] = agent_display
+            with self._seq_lock:
+                msg["_seq"] = self._msg_seq
+                self._msg_seq += 1
             self.msg_queue.put(msg)
-            _, label = self.registry.get_voice(registry_key)
             return json.dumps({"ok": True, "voice": voice, "label": label})
-
-        if cmd == "assignments":
-            return json.dumps({"ok": True, "assignments": self.registry.get_assignments()})
-
-        if cmd == "assign":
-            agent = msg.get("agent", "")
-            voice = msg.get("voice", "")
-            ok = self.registry.assign(agent, voice)
-            return json.dumps({"ok": ok, "error": None if ok else f"Voice {voice} not in pool"})
-
-        if cmd == "pool":
-            return json.dumps({"ok": True, "pool": self.registry.get_pool()})
-
-        if cmd == "stop":
-            self.msg_queue.put({"_internal": "stop"})
-            return json.dumps({"ok": True})
 
         if cmd == "status":
             state = self.player.state
@@ -572,40 +599,57 @@ class VoicePlayerUI:
                 "text": self.current_item.get("text") if self.current_item else None,
             })
 
-        if cmd == "reset":
-            self.registry.reset()
-            return json.dumps({"ok": True})
-
         return json.dumps({"ok": False, "error": f"Unknown command: {cmd}"})
 
     # ── Polling ──────────────────────────────────────────────────────────
 
-    def _poll_queue(self):
-        try:
+    def _start_tts_dispatcher(self):
+        """Dispatch incoming messages to TTS generation threads immediately."""
+        def dispatcher():
             while True:
-                msg = self.msg_queue.get_nowait()
-                if msg.get("_internal") == "stop":
-                    self.player.stop()
-                else:
-                    self._handle_message(msg)
-        except queue.Empty:
-            pass
-        self.root.after(100, self._poll_queue)
+                msg = self.msg_queue.get()
+                # Spawn a thread for each message — TTS generates in parallel
+                threading.Thread(target=self._generate_and_enqueue, args=(msg,), daemon=True).start()
+
+        threading.Thread(target=dispatcher, daemon=True).start()
+
+    def _start_playback_worker(self):
+        """Play items from the play queue one at a time, sequentially."""
+        def worker():
+            while not self._shutting_down:
+                try:
+                    item = self._play_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                done_event = threading.Event()
+                self.root.after(0, lambda i=item, e=done_event: self._play_item(i, e))
+                done_event.wait(timeout=60.0)  # safety cap: don't block forever
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _poll_state(self):
-        state = self.player.state
-        if state == "playing":
-            self.status_dot.configure(fg=C["green"])
-            self.status_text.configure(text="Playing\u2026")
-        elif state == "paused":
+        if self._muted:
             self.status_dot.configure(fg=C["yellow"])
-            self.status_text.configure(text="Paused")
+            self.status_text.configure(text="Muted")
+            self.pause_btn.configure(text="\u23f8 Pause", state="disabled")
+            self.replay_btn.configure(state="disabled")
         else:
-            if self._playing and (time.time() - self._play_started_at) > 0.3:
-                self._playing = False
-                self.root.after(50, self._drain_play_queue)
-            self.status_dot.configure(fg=C["subtext"])
-            self.status_text.configure(text="Finished" if self.current_item else "Idle")
+            state = self.player.state
+            if state == "playing":
+                self.status_dot.configure(fg=C["green"])
+                self.status_text.configure(text="Playing\u2026")
+                self.pause_btn.configure(text="\u23f8 Pause", state="normal")
+                self.replay_btn.configure(state="normal")
+            elif state == "paused":
+                self.status_dot.configure(fg=C["yellow"])
+                self.status_text.configure(text="Paused")
+                self.pause_btn.configure(text="\u25b6 Resume", state="normal")
+                self.replay_btn.configure(state="normal")
+            else:
+                self.status_dot.configure(fg=C["subtext"])
+                self.status_text.configure(text="Finished" if self.current_item else "Idle")
+                self.pause_btn.configure(text="\u23f8 Pause", state="disabled")
+                self.replay_btn.configure(state="normal" if self.current_item else "disabled")
         self.root.after(250, self._poll_state)
 
     def _poll_history_age(self):
@@ -616,41 +660,120 @@ class VoicePlayerUI:
 
     # ── Message Handling ─────────────────────────────────────────────────
 
-    def _handle_message(self, msg):
+    def _generate_and_enqueue(self, msg):
+        """Generate TTS for a message and put the ready item on the play queue in order."""
         text = msg.get("text", "")
         agent = msg.get("agent", "unknown")
-        name = msg.get("name", agent)
-        model = _model_from_agent(name)
-        session = msg.get("session", "default")
+        agent_display = msg.get("agent_display", agent)
         voice = msg.get("voice", "")
         rate = msg.get("rate", DEFAULT_RATE)
+        seq = msg.get("_seq", 0)
         now = datetime.now()
         ts = now.strftime("%H:%M:%S")
 
-        # Bring window to front
+        self.root.after(0, self._on_new_message)
+
+        try:
+            path = self._generate_tts(text, voice, rate)
+        except Exception as e:
+            self.root.after(0, lambda err=str(e): self._show_error(err))
+            # Still need to advance the sequence so we don't block the queue
+            with self._reorder_lock:
+                self._next_play_seq += 1
+                self._flush_reorder_buf()
+            return
+
+        item = dict(text=text, agent=agent, agent_display=agent_display,
+                    voice=voice, rate=rate, audio_path=str(path), timestamp=ts,
+                    created=now, _seq=seq, status="queued")
+
+        # Add to history immediately so it appears in the list
+        self.root.after(0, lambda i=item: self._add_to_history_queued(i))
+
+        # Put into reorder buffer and flush in-order items to play queue
+        with self._reorder_lock:
+            self._reorder_buf[seq] = item
+            self._flush_reorder_buf()
+
+    def _flush_reorder_buf(self):
+        """Move consecutive ready items from reorder buffer to play queue. Must hold _reorder_lock."""
+        while self._next_play_seq in self._reorder_buf:
+            item = self._reorder_buf.pop(self._next_play_seq)
+            self._play_queue.put(item)
+            self._next_play_seq += 1
+        self.root.after(0, self._update_queue_count)
+
+    def _on_new_message(self):
+        """Bring window to front when a new message arrives."""
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
 
-        # Show generating status if nothing else is playing
-        if not self._playing:
-            self._set_message(text)
-            self.agent_label.configure(text=f"{model} \u2022 {name}")
-            self.root.title(f"Claude Voice \u2014 {session}")
-            self.time_label.configure(text=ts)
-            self.status_text.configure(text="Generating\u2026")
-            self.status_dot.configure(fg=C["yellow"])
+    def _update_queue_count(self):
+        """Update the queue count display."""
+        count = self._play_queue.qsize()
+        if count > 0:
+            self.queue_label.configure(text=f"{count} queued")
+        else:
+            self.queue_label.configure(text="")
 
-        def gen_and_enqueue():
+    def _play_item(self, item, done_event):
+        """Start playback and poll for completion (must be called on Tk thread)."""
+        # Mark as playing in history
+        item["status"] = "playing" if not self._muted else "done"
+        self.current_item = item
+        self._set_message(item["text"])
+        agent_display = item.get("agent_display", item.get("agent", "?"))
+        self.agent_label.configure(text=agent_display)
+        self.time_label.configure(text=item["timestamp"])
+        self._refresh_history()
+        self._update_queue_count()
+
+        if self._muted:
+            done_event.set()
+            return
+
+        audio_path = item["audio_path"]
+        if not os.path.exists(audio_path):
+            item["status"] = "done"
+            self._refresh_history()
+            done_event.set()
+            return
+
+        self.player.play(audio_path)
+        play_start = time.time()
+        duration_s = self.player.duration_ms / 1000.0 if self.player.duration_ms else 0
+
+        def wait_for_finish():
+            if self._shutting_down or self._muted:
+                item["status"] = "done"
+                self._refresh_history()
+                done_event.set()
+                return
+            state = self.player.state
+            elapsed = time.time() - play_start
+            min_wait = max(duration_s * 0.8, 2.0) if duration_s > 0 else 2.0
+            if state == "playing" or state == "paused" or elapsed < min_wait:
+                self.root.after(200, wait_for_finish)
+            else:
+                item["status"] = "done"
+                self._refresh_history()
+                self._update_queue_count()
+                done_event.set()
+
+        self.root.after(200, wait_for_finish)
+
+    def _add_to_history_queued(self, item):
+        """Add item to history in arrival order (by sequence number). Oldest first, newest last."""
+        self.history.append(item)
+        self.history.sort(key=lambda h: h.get("_seq", 0))
+        while len(self.history) > MAX_HISTORY:
+            old = self.history.pop(0)
             try:
-                path = self._generate_tts(text, voice, rate)
-                item = dict(text=text, agent=agent, name=name, model=model, session=session, voice=voice, rate=rate, audio_path=str(path), timestamp=ts, created=now)
-                self._play_queue.put(item)
-                self.root.after(0, self._drain_play_queue)
-            except Exception as e:
-                self.root.after(0, lambda: self._show_error(str(e)))
-
-        threading.Thread(target=gen_and_enqueue, daemon=True).start()
+                os.unlink(old["audio_path"])
+            except OSError:
+                pass
+        self._refresh_history()
 
     def _generate_tts(self, text, voice, rate=DEFAULT_RATE):
         import edge_tts
@@ -669,37 +792,6 @@ class VoicePlayerUI:
         finally:
             loop.close()
         return path
-
-    def _drain_play_queue(self):
-        """Start the next queued item if nothing is currently playing."""
-        if self._playing:
-            return
-        try:
-            item = self._play_queue.get_nowait()
-        except queue.Empty:
-            return
-        self._playing = True
-        self._start_playback(item)
-
-    def _start_playback(self, item):
-        self.current_item = item
-        # Update display for this item
-        self._set_message(item["text"])
-        self.agent_label.configure(text=f"{item['model']} \u2022 {item['name']}")
-        self.root.title(f"Claude Voice \u2014 {item['session']}")
-        self.time_label.configure(text=item["timestamp"])
-        self._play_started_at = time.time()
-        self.player.play(item["audio_path"])
-
-        # Push to history
-        self.history.insert(0, item)
-        while len(self.history) > MAX_HISTORY:
-            old = self.history.pop()
-            try:
-                os.unlink(old["audio_path"])
-            except OSError:
-                pass
-        self._refresh_history()
 
     def _set_message(self, text):
         """Update message display with auto-sizing height."""
@@ -738,48 +830,72 @@ class VoicePlayerUI:
             ago = self._time_ago(item["created"]) if "created" in item else ""
             clock = item.get("timestamp", "")
             time_col = f"{clock} ({ago})" if ago else clock
-            session = item.get("session", "?")
-            model = item.get("model", _model_from_agent(item.get("agent", "")))
-            name = item.get("name", item["agent"])
-            self.hist_tree.insert("", "end", iid=str(i), values=(time_col, session, model, name, item["text"]))
+            agent_display = item.get("agent_display", item.get("agent", "?"))
+            status = item.get("status", "done")
+            if status == "playing":
+                prefix = "\u25b6 "
+            elif status == "queued":
+                prefix = "\u23f3 "
+            else:
+                prefix = ""
+            self.hist_tree.insert("", "end", iid=str(i),
+                values=(time_col, agent_display, f"{prefix}{item['text']}"),
+                tags=(status,))
+        # Auto-scroll to bottom so newest items are visible
+        children = self.hist_tree.get_children()
+        if children:
+            self.hist_tree.see(children[-1])
 
     # ── Button Handlers ──────────────────────────────────────────────────
-
-    def _on_play(self):
-        state = self.player.state
-        if state == "paused":
-            self.player.resume()
-        elif self.current_item:
-            self.player.play(self.current_item["audio_path"])
 
     def _on_pause(self):
         state = self.player.state
         if state == "playing":
             self.player.pause()
+            self.pause_btn.configure(text="\u25b6 Resume")
         elif state == "paused":
             self.player.resume()
+            self.pause_btn.configure(text="\u23f8 Pause")
 
     def _on_replay(self):
+        if self._muted:
+            return
         if self.current_item:
-            self.player.play(self.current_item["audio_path"])
+            path = self.current_item["audio_path"]
+            if os.path.exists(path):
+                self.player.play(path)
+
+    def _on_mute(self):
+        self._muted = not self._muted
+        if self._muted:
+            self.mute_btn.configure(text="\U0001f507 Muted", bg=C["muted_bg"], fg=C["muted_fg"])
+            self.player.stop()
+        else:
+            self.mute_btn.configure(text="\U0001f50a Sound", bg=C["surface"], fg=C["text"])
 
     def _on_hist_click(self, _event=None):
         sel = self.hist_tree.selection()
         if not sel:
             return
-        item = self.history[int(sel[0])]
+        try:
+            item = self.history[int(sel[0])]
+        except (IndexError, ValueError):
+            return
+        if item.get("status") in ("queued", "playing"):
+            return  # can't replay items still in the queue
         self.current_item = item
         self._set_message(item["text"])
-        model = item.get("model", _model_from_agent(item.get("agent", "")))
-        name = item.get("name", item["agent"])
-        self.agent_label.configure(text=f"{model} \u2022 {name}")
-        self.root.title(f"Claude Voice — {item.get('session', '?')}")
+        agent_display = item.get("agent_display", item.get("agent", "?"))
+        self.agent_label.configure(text=agent_display)
         self.time_label.configure(text=item["timestamp"])
-        self.player.play(item["audio_path"])
+        if not self._muted:
+            path = item["audio_path"]
+            if os.path.exists(path):
+                self.player.play(path)
 
     def _on_close(self):
         self.player.stop()
-        self.root.destroy()
+        self.root.withdraw()
 
     # ── Run ───────────────────────────────────────────────────────────────
 
@@ -788,11 +904,35 @@ class VoicePlayerUI:
 
 
 if __name__ == "__main__":
-    # Exit immediately if another instance already has the port
-    _check = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # ── Single-instance guard using a Windows named mutex ──
+    # Atomic and race-free. Only one process can hold the mutex.
+    # The OS automatically releases it if the process crashes or is killed.
+    _mutex = None
+    if sys.platform == "win32":
+        _mutex = ctypes.windll.kernel32.CreateMutexW(None, True, "Claude_Voice_MCP_SingleInstance")
+        _last_err = ctypes.windll.kernel32.GetLastError()
+        if _last_err == 183:  # ERROR_ALREADY_EXISTS
+            ctypes.windll.kernel32.CloseHandle(_mutex)
+            sys.exit(0)
+
+    # If we hold the mutex, kill any zombie holding the port
+    # (crashed process that released the mutex but didn't release the port)
+    kill_port_holder()
+
     try:
-        _check.bind(("127.0.0.1", VOICE_SERVER_PORT))
-        _check.close()
-    except OSError:
-        sys.exit(0)
-    VoicePlayerUI().run()
+        VoicePlayerUI().run()
+    except Exception as _exc:
+        # Log crash so it's diagnosable (stderr may go to DEVNULL when launched detached)
+        try:
+            import traceback
+            with open(LOG_FILE, "a", encoding="utf-8") as _f:
+                _ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                _f.write(f"[{_ts}] CRASH: {_exc}\n")
+                traceback.print_exc(file=_f)
+        except OSError:
+            pass
+        raise
+    finally:
+        if _mutex and sys.platform == "win32":
+            ctypes.windll.kernel32.ReleaseMutex(_mutex)
+            ctypes.windll.kernel32.CloseHandle(_mutex)

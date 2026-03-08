@@ -58,38 +58,47 @@ def voice_speak(
     model: str,
     role: str = "main",
     project: str = "default",
-    session: str = "default",
     task: str = "main",
     voice: str | None = None,
     rate: str = DEFAULT_RATE,
 ) -> str:
-    """Speak a message aloud using text-to-speech. Each unique combination of
-    project + session + task + model + role gets a persistent voice from a pool of 42 voices.
+    """Speak a message aloud using text-to-speech.
 
-    IMPORTANT — How to fill in the parameters:
-    - model: Your AI model name in lowercase. One of: "opus", "sonnet", "haiku".
-    - role: Your role/purpose. One of: "main", "explore", "test", "plan", "review".
-    - project: The project/codebase you are working in. Use the name of the current
-      working directory (e.g. "trace", "myapp"). Just one word, no slashes.
-    - session: What the user asked you to work on (e.g. "editor", "map-perf", "auth-fix").
+    Each agent gets a unique, persistent voice based on its identity parameters.
+    CRITICAL: Always use the SAME parameter values across calls so your voice stays consistent.
+    Changing any parameter creates a new identity and assigns a different voice.
+
+    Agent identity = project/task/role (model)
+    These four values determine your voice. Pick them once and reuse them every call.
+
+    Parameters:
+    - model (required): Your AI model in lowercase: "opus", "sonnet", or "haiku".
+    - project: The project name — your current working directory (e.g. "myapp"). One word, no slashes.
+    - task: What the user asked you to work on (e.g. "mute-button", "auth-fix").
       Pick a short name on your first call and reuse it for the entire conversation.
-      Just one word or hyphenated-word, no slashes.
-    - task: What THIS agent is doing. Main agents use "main". Subagents describe their
-      specific job (e.g. "research", "tests", "table-investigation", "dessert").
-      If the parent agent told you a task name, use it.
+      One word or hyphenated-word, no slashes.
+    - role: What you are doing. Use "main" if you are the primary agent.
+      Subagents use their function: "explore", "test", "plan", "review".
 
     Examples:
-      Main agent working on editor:         project="trace", session="editor", task="main"
-      Subagent researching for editor:      project="trace", session="editor", task="research"
-      Subagent running tests for editor:    project="trace", session="editor", task="tests"
+      Main agent on mute-button feature:    project="voicemcp", task="mute-button", role="main"
+        -> voicemcp/mute-button/main (opus)
+      Subagent exploring code for same:     project="voicemcp", task="mute-button", role="explore"
+        -> voicemcp/mute-button/explore (sonnet)
+      Subagent running tests:               project="voicemcp", task="mute-button", role="test"
+        -> voicemcp/mute-button/test (haiku)
+      Different task, same project:         project="voicemcp", task="dark-mode", role="main"
+        -> voicemcp/dark-mode/main (opus)
+
+    When spawning subagents, pass them your project and task values so they share the
+    same task context. Only the role (and possibly model) should differ.
 
     Args:
         text: The message to speak aloud. Keep it concise (1-3 sentences).
         model: Your model name: "opus", "sonnet", or "haiku".
-        role: Your role: "main", "explore", "test", "plan", "review", etc.
-        project: Project name — just your current working directory name. No slashes.
-        session: What the user asked for — one word like "editor" or "auth-fix". No slashes.
-        task: What you are doing — "main" for main agents, or a short description for subagents.
+        role: Your function: "main", "explore", "test", "plan", or "review".
+        project: Project name — your current working directory name. No slashes.
+        task: The feature/task you are working on. No slashes.
         voice: Optional override. A full Edge TTS voice ID like "en-US-AriaNeural". Rarely needed.
         rate: Speech rate adjustment. Default "+25%". Use "+0%" for normal, up to "+100%" for fast, or negative like "-10%" for slower.
     """
@@ -98,14 +107,14 @@ def voice_speak(
 
     rate = validate_rate(rate)
 
-    agent_id = f"{model}-{role}"
-    session_path = f"{project}/{session}/{task}"
+    agent_key = f"{project}/{task}/{role}"
+    agent_display = f"{agent_key} ({model})"
     message = {
         "cmd": "speak",
         "text": text,
-        "agent": agent_id,
-        "name": agent_id,
-        "session": session_path,
+        "agent": agent_key,
+        "model": model,
+        "agent_display": agent_display,
         "rate": rate,
     }
     if voice:
@@ -113,72 +122,13 @@ def voice_speak(
 
     result = send_command(message)
     if result and result.get("ok"):
-        assigned_voice = result.get("voice", "?")
         label = result.get("label", "")
-        response = f"[{session_path}/{agent_id}] {label}: {text}"
-        log_command("voice_speak", {"model": model, "role": role, "project": project, "session": session, "task": task, "rate": rate, "text": text}, response)
+        response = f"[{agent_display}] {label}: {text}"
+        log_command("voice_speak", {"model": model, "role": role, "project": project, "task": task, "rate": rate, "text": text}, response)
         return response
     error = f"Error: {result.get('error', 'unknown') if result else 'server unreachable'}"
-    log_command("voice_speak", {"model": model, "role": role, "project": project, "session": session, "task": task, "rate": rate, "text": text}, error)
+    log_command("voice_speak", {"model": model, "role": role, "project": project, "task": task, "rate": rate, "text": text}, error)
     return error
-
-
-@mcp.tool()
-def voice_stop() -> str:
-    """Stop any currently playing voice audio."""
-    result = send_command({"cmd": "stop"})
-    if result and result.get("ok"):
-        log_command("voice_stop", {}, "Playback stopped.")
-        return "Playback stopped."
-    log_command("voice_stop", {}, "Voice UI not running.")
-    return "Voice UI not running."
-
-
-@mcp.tool()
-def voice_assignments() -> str:
-    """Show all current voice assignments (which agent has which voice).
-
-    Returns a formatted table of all project/session/agent -> voice mappings.
-    """
-    if not ensure_server():
-        return "Error: Voice UI server is not running."
-
-    result = send_command({"cmd": "assignments"})
-    if not result or not result.get("ok"):
-        return "Error: Failed to get assignments."
-
-    assignments = result["assignments"]
-    if not assignments:
-        return "No voice assignments yet. Agents get voices on first speak."
-
-    lines = [f"{'Key':<40} {'Voice':<30} {'Label'}"]
-    lines.append("-" * 85)
-    for key, info in sorted(assignments.items()):
-        lines.append(f"{key:<40} {info['voice']:<30} {info['label']}")
-    return "\n".join(lines)
-
-
-@mcp.tool()
-def voice_pool() -> str:
-    """Show the curated voice pool with assignment status.
-
-    Returns a table of all available voices with their gender, locale,
-    and which agent (if any) they're currently assigned to.
-    """
-    if not ensure_server():
-        return "Error: Voice UI server is not running."
-
-    result = send_command({"cmd": "pool"})
-    if not result or not result.get("ok"):
-        return "Error: Failed to get pool."
-
-    pool = result["pool"]
-    lines = [f"{'Voice':<30} {'Gender':<8} {'Locale':<8} {'Assigned To'}"]
-    lines.append("-" * 80)
-    for v in pool:
-        assigned = v.get("assigned_to") or ""
-        lines.append(f"{v['name']:<30} {v['gender']:<8} {v['locale']:<8} {assigned}")
-    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -203,10 +153,11 @@ def voice_log(limit: int = 20) -> str:
         if tool == "voice_speak":
             model = entry.get("model", "?")
             role = entry.get("role", "?")
-            session = entry.get("session", "?")
+            project = entry.get("project", "?")
+            task = entry.get("task", "?")
             text = entry.get("text", "")
             preview = text[:60] + "..." if len(text) > 60 else text
-            output.append(f"[{ts}] {tool} | {session}/{model}-{role} | {preview}")
+            output.append(f"[{ts}] {project}/{task}/{role} ({model}) | {preview}")
         else:
             result = entry.get("result", "")
             output.append(f"[{ts}] {tool} | {result}")
@@ -225,12 +176,13 @@ def voice_setup() -> str:
     return '''## Voice Rule — paste this into your CLAUDE.md rules section:
 
 **ALWAYS USE VOICE** — MANDATORY: call the `voice_speak` MCP tool with every completion or question.
-- `model`: your model — `opus`, `sonnet`, or `haiku`
-- `role`: your role — `main`, `explore`, `test`, `plan`, `review`, etc.
+- `model`: your model in lowercase — `opus`, `sonnet`, or `haiku`.
 - `project`: project name — just your cwd name (e.g. `trace`). No slashes.
-- `session`: what the user asked for — one word (e.g. `editor`, `map-perf`). No slashes.
-- `task`: what you are doing — `main` for main agents, or a short name for subagents (e.g. `research`, `tests`).
-- When spawning subagents, tell them the project, session, and their task name.'''
+- `task`: the feature/task the user asked you to work on (e.g. `mute-button`, `auth-fix`). Pick once, reuse every call. No slashes.
+- `role`: your function — `main` for the primary agent, or `explore`, `test`, `plan`, `review` for subagents.
+- CRITICAL: Use the SAME values every call. project + task + role + model = your voice identity. Changing any value changes your voice.
+- When spawning subagents, pass them your `project` and `task` values. Only `role` (and possibly `model`) should differ.
+- Messages queue up and play one after the next automatically.'''
 
 
 # ── Entry Point ──────────────────────────────────────────────────────────────

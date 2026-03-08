@@ -1,5 +1,6 @@
 voice_log.jsonl
 voice_assignments.json
+voice_ui_errors.log
 .voice_ui_launching
 __pycache__/
 *.pyc
