@@ -17,6 +17,7 @@ Usage in ~/.claude/settings.json or claude_desktop_config.json:
 """
 
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -120,7 +121,14 @@ def voice_speak(
     if voice:
         message["voice"] = voice
 
-    result = send_command(message)
+    # Retry with short intervals if the server just started
+    result = None
+    for _ in range(10):
+        result = send_command(message)
+        if result:
+            break
+        time.sleep(0.2)
+
     if result and result.get("ok"):
         label = result.get("label", "")
         response = f"[{agent_display}] {label}: {text}"

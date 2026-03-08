@@ -1,3 +1,5 @@
 edge-tts>=6.1,<7
 mcp>=1.0,<2
+pystray>=0.19
+Pillow>=10.0
 # Also requires tkinter (included with Python on Windows/macOS, install python3-tk on Linux)

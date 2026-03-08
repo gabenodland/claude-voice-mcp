@@ -99,29 +99,48 @@ def kill_port_holder(port: int = VOICE_SERVER_PORT) -> bool:
 
 
 def launch_ui_server():
-    """Launch voice_ui.py as a detached background process with error logging."""
+    """Launch voice_ui.py outside the current process tree.
+
+    On Windows, the MCP server runs inside Electron's Job Object, which causes
+    ~30s subprocess startup delays (Windows Defender + Job Object inheritance).
+    Using WMI Win32_Process.Create launches via svchost.exe, fully escaping
+    the Electron process tree. Falls back to subprocess.Popen if WMI fails.
+    """
     ui_script = _PROJECT_DIR / "voice_ui.py"
-    err_file = open(LOG_FILE, "a", encoding="utf-8")
-    try:
-        if sys.platform == "win32":
-            DETACHED = 0x00000008
-            NEW_GROUP = 0x00000200
-            subprocess.Popen(
-                [sys.executable, str(ui_script)],
-                creationflags=DETACHED | NEW_GROUP,
-                stdout=subprocess.DEVNULL,
-                stderr=err_file,
+
+    if sys.platform == "win32":
+        pythonw = Path(sys.executable).parent / "pythonw.exe"
+        exe = str(pythonw) if pythonw.exists() else sys.executable
+        cmd_line = f'"{exe}" "{ui_script}"'
+
+        try:
+            # WMI Win32_Process.Create runs via svchost.exe — outside Electron's
+            # Job Object, avoiding the 30-second Defender/job-throttle delay.
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"([wmiclass]'Win32_Process').Create('{cmd_line}')"],
+                capture_output=True, text=True, timeout=10,
             )
-        else:
-            # TODO: cross-platform — audio player needs a non-MCI backend
-            subprocess.Popen(
-                [sys.executable, str(ui_script)],
-                start_new_session=True,
-                stdout=subprocess.DEVNULL,
-                stderr=err_file,
-            )
-    finally:
-        err_file.close()
+            if result.returncode == 0 and "ReturnValue" in result.stdout:
+                return
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+        # Fallback: direct Popen (may be slow inside Electron)
+        CREATE_NO_WINDOW = 0x08000000
+        subprocess.Popen(
+            [exe, str(ui_script)],
+            creationflags=CREATE_NO_WINDOW,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    else:
+        subprocess.Popen(
+            [sys.executable, str(ui_script)],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
 
 _LAUNCH_MUTEX_NAME = "Claude_Voice_MCP_LaunchLock"
@@ -134,7 +153,7 @@ def ensure_server() -> bool:
     Strategy: ping → acquire lock → re-ping → kill zombie → launch → poll.
     """
     # Fast path: already running
-    result = send_command({"cmd": "status"}, timeout=3.0)
+    result = send_command({"cmd": "status"}, timeout=1.0)
     if result:
         return True
 
@@ -159,7 +178,7 @@ def ensure_server() -> bool:
 def _launch_under_lock() -> bool:
     """The actual launch logic, called while holding the launch mutex."""
     # Re-check after acquiring lock — another process may have launched while we waited
-    result = send_command({"cmd": "status"}, timeout=3.0)
+    result = send_command({"cmd": "status"}, timeout=1.0)
     if result:
         return True
 
@@ -168,15 +187,15 @@ def _launch_under_lock() -> bool:
 
     launch_ui_server()
 
-    return _poll_for_server(timeout=8.0)
+    return _poll_for_server(timeout=10.0)
 
 
-def _poll_for_server(timeout: float = 8.0) -> bool:
-    """Poll for server readiness up to `timeout` seconds."""
-    iterations = int(timeout / 0.5)
-    for _ in range(iterations):
-        time.sleep(0.5)
-        result = send_command({"cmd": "status"}, timeout=3.0)
+def _poll_for_server(timeout: float = 10.0) -> bool:
+    """Poll for server readiness up to `timeout` seconds (wall-clock)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.25)
+        result = send_command({"cmd": "status"}, timeout=0.5)
         if result:
             return True
     return False
